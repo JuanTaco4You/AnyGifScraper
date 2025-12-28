@@ -45,4 +45,5 @@ python grab_webp_gif_browser.py
 
 pip install playwright
 python -m playwright install chromium
+chmod +x script.py
 python script.py 
