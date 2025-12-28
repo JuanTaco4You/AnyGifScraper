@@ -31,8 +31,8 @@ python3 script.py
 
 =================================================================================================================
 pip install playwright
-python3 -m playwright install chromium
-python3 grab_webp_gif_browser.py
+python -m playwright install chromium
+python grab_webp_gif_browser.py
 
 
 
@@ -44,6 +44,5 @@ python3 grab_webp_gif_browser.py
 
 
 pip install playwright
-python3 -m playwright install chromium
-chmod +x script.py
-python3 script.py 
+python -m playwright install chromium
+python script.py 
