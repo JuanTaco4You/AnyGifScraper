@@ -21,3 +21,7 @@ Paste a link → it scans the page HTML → downloads matching assets → shows 
 ## Install
 ```bash
 pip install requests beautifulsoup4
+
+## RUN 
+python3 script.py
+
