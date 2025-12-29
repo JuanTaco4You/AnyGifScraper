@@ -1,3 +1,6 @@
+if you need help lmk. setting this up is super basic and lightweight.
+
+
 # AnyGifScraper
 clipsglitched 
 # WEBP/GIF Grabber (max 100)
