@@ -46,13 +46,25 @@ SCROLL_STEPS = 0
 SCROLL_WAIT_S = 0.8
 
 TIMEOUT_MS = 45000
-EXTS = (".webp", ".gif")
+EXTS = (".webp", ".gif", ".webm")
 REQ_HEADERS = {
     "Accept": "image/avif,image/webp,image/gif,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
+JSON_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": REQ_HEADERS["User-Agent"],
+}
+GRAPHQL_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "User-Agent": REQ_HEADERS["User-Agent"],
+}
+GIPHY_KEY_MISSING = object()
 
 
 def safe_filename(name: str) -> str:
@@ -91,7 +103,7 @@ def looks_like_target(url: str, content_type: str) -> bool:
         return True
 
     ct = (content_type or "").lower()
-    return ("image/webp" in ct) or ("image/gif" in ct)
+    return ("image/webp" in ct) or ("image/gif" in ct) or ("video/webm" in ct)
 
 
 def ext_from_type_or_url(url: str, content_type: str) -> str:
@@ -104,6 +116,8 @@ def ext_from_type_or_url(url: str, content_type: str) -> str:
         return ".webp"
     if "image/gif" in ct:
         return ".gif"
+    if "video/webm" in ct:
+        return ".webm"
     return ""
 
 
@@ -118,6 +132,62 @@ def save_bytes(out_dir: str, url: str, content_type: str, body: bytes, index: in
     return save_path
 
 
+def normalize_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("cdn."):
+        return "https://" + u
+    return u
+
+
+def dedupe_urls(urls):
+    seen = set()
+    out = []
+    for url in urls:
+        u = normalize_url(url)
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def pick_list(data, keys):
+    if isinstance(data, list):
+        return True, data
+    if isinstance(data, dict):
+        for key in keys:
+            if key in data and isinstance(data[key], list):
+                return True, data[key]
+    return False, []
+
+
+def get_query_param(parsed, keys):
+    params = parse_qs(parsed.query)
+    for key in keys:
+        value = params.get(key, [""])[0].strip()
+        if value:
+            return value
+    return ""
+
+
+def looks_like_7tv_id(value: str) -> bool:
+    if re.fullmatch(r"[a-f0-9]{24}", value or "", re.I):
+        return True
+    return bool(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", (value or "").upper()))
+
+
+def query_from_path(parsed, prefix: str) -> str:
+    if parsed.path.startswith(prefix):
+        value = parsed.path[len(prefix):].strip("/")
+        if value:
+            return unquote(value)
+    return ""
+
+
 def betterttv_targets(page_url: str, limit: int):
     parsed = urlparse(page_url)
     if parsed.netloc not in ("betterttv.com", "www.betterttv.com"):
@@ -127,7 +197,7 @@ def betterttv_targets(page_url: str, limit: int):
     if requests is None:
         return None
 
-    query = parse_qs(parsed.query).get("query", [""])[0].strip()
+    query = get_query_param(parsed, ("query", "q", "search", "term"))
     if not query:
         return []
 
@@ -136,7 +206,7 @@ def betterttv_targets(page_url: str, limit: int):
         resp = requests.get(
             api_url,
             params={"query": query, "offset": 0, "limit": limit},
-            headers=REQ_HEADERS,
+            headers=JSON_HEADERS,
             timeout=30,
         )
         resp.raise_for_status()
@@ -155,6 +225,224 @@ def betterttv_targets(page_url: str, limit: int):
         code = emote.get("code") or emote_id
         base = f"https://cdn.betterttv.net/emote/{emote_id}/3x"
         targets.append({"urls": [f"{base}.webp", base], "name": code})
+    return targets
+
+
+def seventv_cdn_urls(emote_id: str):
+    urls = []
+    for size in ("4x", "3x", "2x", "1x"):
+        for ext in (".gif", ".webp"):
+            urls.append(f"https://cdn.7tv.app/emote/{emote_id}/{size}{ext}")
+    return urls
+
+
+def seventv_urls_from_item(item):
+    urls = []
+    host = item.get("host")
+    if not host and isinstance(item.get("data"), dict):
+        host = item["data"].get("host")
+
+    if isinstance(host, dict):
+        base = normalize_url(host.get("url"))
+        files = host.get("files") or []
+        for file in files:
+            name = file.get("name")
+            if name and base:
+                url = urljoin(base + "/", name)
+                if looks_like_target(url, ""):
+                    urls.append(url)
+
+    emote_id = item.get("id") or item.get("_id")
+    if emote_id and not urls:
+        urls.extend(seventv_cdn_urls(emote_id))
+
+    return dedupe_urls(urls)
+
+
+def seventv_api_search(query: str, limit: int):
+    gql = """
+    query SearchEmotes($query: String!, $limit: Int, $page: Int) {
+      emotes(query: $query, limit: $limit, page: $page) {
+        items { id name host { url files { name format } } }
+      }
+    }
+    """
+
+    try:
+        resp = requests.post(
+            "https://7tv.io/v3/gql",
+            headers=GRAPHQL_HEADERS,
+            json={"query": gql, "variables": {"query": query, "limit": limit, "page": 1}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    items = data.get("data", {}).get("emotes", {}).get("items")
+    return items if isinstance(items, list) else []
+
+
+def seventv_targets(page_url: str, limit: int):
+    parsed = urlparse(page_url)
+    if parsed.netloc not in ("7tv.app", "www.7tv.app", "7tv.io", "www.7tv.io"):
+        return None
+    if requests is None:
+        return None
+
+    emote_id = query_from_path(parsed, "/emotes/")
+    if emote_id and "/" not in emote_id and looks_like_7tv_id(emote_id):
+        return [{"urls": seventv_cdn_urls(emote_id), "name": emote_id}]
+
+    query = get_query_param(parsed, ("query", "q", "search", "term"))
+    if not query:
+        query = query_from_path(parsed, "/search/")
+    if not query and emote_id and "/" not in emote_id:
+        query = emote_id
+    if not query:
+        return []
+
+    items = seventv_api_search(query, limit)
+    targets = []
+    for item in items:
+        emote_id = item.get("id") or item.get("_id")
+        name = item.get("name") or item.get("code") or emote_id
+        urls = seventv_urls_from_item(item)
+        if urls:
+            targets.append({"urls": urls, "name": name})
+    return targets
+
+
+def ffz_api_search(query: str, limit: int):
+    endpoints = [
+        ("https://api.frankerfacez.com/v1/emotes", {"q": query, "per_page": limit}),
+        ("https://api.frankerfacez.com/v1/search/emotes", {"q": query, "per_page": limit}),
+    ]
+
+    for url, params in endpoints:
+        try:
+            resp = requests.get(url, params=params, headers=JSON_HEADERS, timeout=30)
+            if not resp.ok:
+                continue
+            data = resp.json()
+        except Exception:
+            continue
+
+        found, items = pick_list(data, ("emotes", "emoticons", "results"))
+        if found:
+            return items
+
+    return []
+
+
+def ffz_urls_from_emote(emote):
+    urls = []
+
+    def add_urls(url_map):
+        for key in ("4", "2", "1"):
+            url = url_map.get(key)
+            if url:
+                urls.append(url)
+
+    urls_map = emote.get("urls") or {}
+    if isinstance(urls_map, dict):
+        add_urls(urls_map)
+
+    animated = emote.get("animated")
+    if isinstance(animated, dict):
+        anim_urls = animated.get("urls") or {}
+        if isinstance(anim_urls, dict):
+            add_urls(anim_urls)
+
+    return dedupe_urls(urls)
+
+
+def ffz_targets(page_url: str, limit: int):
+    parsed = urlparse(page_url)
+    if parsed.netloc not in ("frankerfacez.com", "www.frankerfacez.com"):
+        return None
+    if requests is None:
+        return None
+
+    query = get_query_param(parsed, ("q", "query", "search", "term"))
+    if not query:
+        query = query_from_path(parsed, "/emoticons/")
+    if not query:
+        return []
+
+    items = ffz_api_search(query, limit)
+    targets = []
+    for item in items:
+        emote_id = item.get("id")
+        name = item.get("name") or item.get("code") or (str(emote_id) if emote_id else None)
+        urls = ffz_urls_from_emote(item)
+        if urls:
+            targets.append({"urls": urls, "name": name})
+    return targets
+
+
+def giphy_targets(page_url: str, limit: int):
+    parsed = urlparse(page_url)
+    if parsed.netloc not in ("giphy.com", "www.giphy.com"):
+        return None
+    if requests is None:
+        return None
+
+    query = get_query_param(parsed, ("q", "query", "search", "term"))
+    if not query:
+        query = query_from_path(parsed, "/search/")
+        if query:
+            query = query.replace("-", " ")
+    if not query:
+        return []
+
+    api_key = os.environ.get("GIPHY_API_KEY", "").strip()
+    if not api_key:
+        return GIPHY_KEY_MISSING
+
+    try:
+        resp = requests.get(
+            "https://api.giphy.com/v1/gifs/search",
+            params={"api_key": api_key, "q": query, "limit": min(limit, 100)},
+            headers=JSON_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    found, items = pick_list(data, ("data",))
+    if not found:
+        return []
+
+    targets = []
+    for item in items:
+        images = item.get("images") or {}
+        urls = []
+
+        original = images.get("original") or {}
+        if original.get("webp"):
+            urls.append(original.get("webp"))
+        if original.get("url"):
+            urls.append(original.get("url"))
+
+        downsized = images.get("downsized_large") or images.get("downsized") or {}
+        if downsized.get("url"):
+            urls.append(downsized.get("url"))
+
+        preview_webp = images.get("preview_webp") or {}
+        if preview_webp.get("url"):
+            urls.append(preview_webp.get("url"))
+
+        urls = dedupe_urls(urls)
+        if not urls:
+            continue
+
+        name = item.get("title") or item.get("slug") or item.get("id")
+        targets.append({"urls": urls, "name": name})
+
     return targets
 
 
@@ -177,7 +465,7 @@ def html_targets(page_url: str):
     except Exception:
         return []
 
-    urls = set(re.findall(r'https?://[^\s"\'<>]+?\.(?:webp|gif)(?:\?[^\s"\'<>]*)?', resp.text, re.I))
+    urls = set(re.findall(r'https?://[^\s"\'<>]+?\.(?:webp|gif|webm)(?:\?[^\s"\'<>]*)?', resp.text, re.I))
 
     if BeautifulSoup:
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -273,6 +561,35 @@ def main():
         else:
             print("[1/1] Using BetterTTV API (no browser required)...")
             download_requests_targets(bttv, out_dir, page_url)
+        return
+
+    seventv = seventv_targets(page_url, MAX_DOWNLOADS)
+    if seventv is not None:
+        if not seventv:
+            print("No emotes found via the 7TV API.")
+        else:
+            print("[1/1] Using 7TV API (no browser required)...")
+            download_requests_targets(seventv, out_dir, page_url)
+        return
+
+    ffz = ffz_targets(page_url, MAX_DOWNLOADS)
+    if ffz is not None:
+        if not ffz:
+            print("No emotes found via the FrankerFaceZ API.")
+        else:
+            print("[1/1] Using FrankerFaceZ API (no browser required)...")
+            download_requests_targets(ffz, out_dir, page_url)
+        return
+
+    giphy = giphy_targets(page_url, MAX_DOWNLOADS)
+    if giphy is GIPHY_KEY_MISSING:
+        print("GIPHY_API_KEY is not set; skipping Giphy API.")
+    elif giphy is not None:
+        if not giphy:
+            print("No GIFs found via the Giphy API.")
+        else:
+            print("[1/1] Using Giphy API (no browser required)...")
+            download_requests_targets(giphy, out_dir, page_url)
         return
 
     if sync_playwright is None:
